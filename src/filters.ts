@@ -56,6 +56,17 @@ const whereError = (id: string, message: string): FilesError => new FilesError(`
 
 const TAKES: Record<QuestionType, string> = { noul: "true or false", choice: "an option label", score: "min and max" };
 
+/** The noul description calls its answers yes and no, so agents write those as often as true and false. */
+const YES_NO = new Map([
+  ["yes", true],
+  ["no", false],
+  ["true", true],
+  ["false", false],
+]);
+
+const asNoul = (value: boolean | string): boolean | string =>
+  typeof value === "string" ? (YES_NO.get(value.trim().toLowerCase()) ?? value) : value;
+
 type Test = (answers: Readonly<Record<string, JevAnswer>>) => boolean;
 
 /** The shorthand `value` means `{ is: value }`. */
@@ -70,7 +81,7 @@ function compileCondition(id: string, info: QuestionInfo | undefined, condition:
   const { is, min, max, decision } = conditionOf(condition);
   const checks: ((answer: JevAnswer) => boolean)[] = [];
   if (is !== undefined) {
-    const wanted = [is].flat();
+    const wanted = type === "noul" ? [is].flat().map(asNoul) : [is].flat();
     const kind = type === "noul" ? "boolean" : "string";
     if (type === "score" || wanted.some((v) => typeof v !== kind)) {
       throw whereError(id, `a ${type} question takes ${TAKES[type]}`);
@@ -167,6 +178,42 @@ export function selector(options: SelectOptions, types: QuestionTypes): (records
       ...(where === undefined ? {} : { matched: passing.length }),
       ...(counting ? { counts: tally(records, types) } : {}),
     };
+  };
+}
+
+/** Largest record text `unsure` carries, in UTF-8 bytes; a larger record stays out, for the agent to open if it must. */
+export const MAX_UNSURE_BYTES = 2_000;
+/** Text `unsure` carries in all, in UTF-8 bytes, so a call over many unsure records still returns a short result. */
+export const MAX_UNSURE_TOTAL_BYTES = 16_000;
+
+/**
+ * The text of each returned record with a review or abstain answer, when small, in result order up to
+ * MAX_UNSURE_TOTAL_BYTES; a record that no longer fits is skipped for a later, smaller one, and
+ * `more_unsure` counts every record left out. Agents check those records, and reading them in the
+ * result saves opening them in another step, which rereads the whole conversation. Bytes rather than
+ * characters keep the budget near the same number of tokens in any script.
+ */
+export function unsureTexts(
+  files: Selection["files"],
+  textOf: (key: string) => string,
+): { unsure?: Record<string, string>; more_unsure?: number } {
+  const unsure: Record<string, string> = {};
+  let total = 0;
+  let left = 0;
+  for (const [key, answers] of Object.entries(files ?? {})) {
+    if (Object.values(answers).every((answer) => answer.decision === "act")) continue;
+    const text = textOf(key);
+    const bytes = Buffer.byteLength(text);
+    if (bytes > MAX_UNSURE_BYTES || total + bytes > MAX_UNSURE_TOTAL_BYTES) {
+      left += 1;
+      continue;
+    }
+    unsure[key] = text;
+    total += bytes;
+  }
+  return {
+    ...(Object.keys(unsure).length > 0 ? { unsure } : {}),
+    ...(left > 0 ? { more_unsure: left } : {}),
   };
 }
 
