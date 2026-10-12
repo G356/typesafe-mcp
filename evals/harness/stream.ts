@@ -1,3 +1,4 @@
+import { basename } from "node:path";
 import { META_KEY } from "../../src/result.ts";
 import type { QuotaInfo, RunMetrics, RunStatus, StreamLine, TokenUsage, ToolCallRecord } from "./types.ts";
 
@@ -5,12 +6,36 @@ type Json = Record<string, unknown>;
 
 export interface ParseContext {
   expectedTools: readonly string[];
+  /** Skills the agent must see at `system/init`; none when absent. */
+  expectedSkills?: readonly string[];
   timedOut: boolean;
   exitCode: number | null;
 }
 
 const ALLOWED_QUOTA = new Set(["allowed", "allowed_warning"]);
 const JEV_PREFIX = "mcp__jev__";
+/**
+ * Code that calls Jev: an import of the TypeSafe SDK or a request to its HTTP API. A path or a note that
+ * names the package, as in `ls node_modules/@typesafe-ai/sdk`, is reading about it, not calling it.
+ */
+const SDK_CALL = /(?:\bfrom|\bimport|\brequire)\s*\(?\s*["']@typesafe-ai\/sdk["']|https?:\/\/api\.typesafe\.ai\b/;
+/** Files a shell command writes, as in `cat > judge.ts <<'EOF'` or `tee judge.ts`. */
+const WRITTEN = /(?:>{1,2}|\btee(?:\s+-a)?)\s*([^\s;&|<>()]+)/g;
+const SCRIPT_FILE = /\.[cm]?[jt]s$/;
+const escapeRegExp = (text: string): string => text.replaceAll(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+
+/** Whether `command` starts `script` with a runner, so editing, reading or naming the script does not count. */
+function runs(command: string, script: string): boolean {
+  const runner = String.raw`(?:bun(?:\s+run)?|node|tsx|npx\s+tsx|deno\s+run)`;
+  return new RegExp(String.raw`(?:^|[\s;&|(])${runner}\s+(?:\S*/)?${escapeRegExp(script)}(?=$|[\s;&|)])`).test(command);
+}
+
+/** The code a Write or Edit call puts in a file, or null for any other call. */
+function codeWritten(name: string, input: Json): string | null {
+  if (name === "Write") return str(input.content) ?? "";
+  if (name === "Edit") return str(input.new_string) ?? "";
+  return null;
+}
 
 const isObj = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
 const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
@@ -41,6 +66,30 @@ function jevInputTokens(toolUseResult: unknown, text: string): number | null {
   }
 }
 
+/**
+ * Whether a call is part of using Jev: a jev MCP call; writing code that calls Jev with Write, Edit or a
+ * shell redirect (the file is remembered in `scripts` by name); or a Bash command that calls Jev inline
+ * or runs one of those scripts.
+ */
+function usesJev(name: string, input: unknown, scripts: Set<string>): boolean {
+  if (name.startsWith(JEV_PREFIX)) return true;
+  if (!isObj(input)) return false;
+  const code = codeWritten(name, input);
+  if (code !== null) {
+    if (!SDK_CALL.test(code)) return false;
+    const path = str(input.file_path);
+    if (path) scripts.add(basename(path));
+    return true;
+  }
+  if (name !== "Bash") return false;
+  const command = str(input.command) ?? "";
+  if (SDK_CALL.test(command)) {
+    for (const [, target = ""] of command.matchAll(WRITTEN)) if (SCRIPT_FILE.test(target)) scripts.add(basename(target));
+    return true;
+  }
+  return [...scripts].some((script) => runs(command, script));
+}
+
 function toQuota(info: unknown): QuotaInfo | null {
   if (!isObj(info)) return null;
   const windows = isObj(info.unifiedWindows) ? info.unifiedWindows : {};
@@ -68,12 +117,21 @@ function usageByModel(result: Json | null): Record<string, TokenUsage> {
   return out;
 }
 
-function invalidReason(init: Json | null, tools: readonly string[], expected: readonly string[]): string | null {
-  if (!init) return "no init event";
+/** Why the sorted `got` differs from `expected`, or null when they match. */
+function listMismatch(what: string, got: readonly string[], expected: readonly string[]): string | null {
   const want = expected.toSorted();
-  if (tools.length !== want.length || tools.some((t, i) => t !== want[i])) {
-    return `tool list mismatch: expected [${want.join(", ")}], got [${tools.join(", ")}]`;
-  }
+  if (got.length === want.length && got.every((t, i) => t === want[i])) return null;
+  return `${what} list mismatch: expected [${want.join(", ")}], got [${got.join(", ")}]`;
+}
+
+function invalidReason(init: Json | null, tools: readonly string[], ctx: ParseContext): string | null {
+  if (!init) return "no init event";
+  const skills = list(init.skills)
+    .filter((s): s is string => typeof s === "string")
+    .toSorted();
+  const mismatch =
+    listMismatch("tool", tools, ctx.expectedTools) ?? listMismatch("skill", skills, ctx.expectedSkills ?? []);
+  if (mismatch) return mismatch;
   const down = list(init.mcp_servers).filter((s) => isObj(s) && s.status !== "connected");
   if (down.length > 0) return `MCP server not connected: ${JSON.stringify(down)}`;
   return null;
@@ -112,9 +170,11 @@ export function parseRun(lines: readonly StreamLine[], ctx: ParseContext): RunMe
   let result: Json | null = null;
   let quota: QuotaInfo | null = null;
   let firstTurnContextTokens: number | null = null;
+  let firstJevContextTokens: number | null = null;
   const contextByMessage = new Map<string, number>();
   const calls = new Map<string, ToolCallRecord>();
   const startedAt = new Map<string, number>();
+  const sdkScripts = new Set<string>();
 
   for (const line of lines) {
     let event: unknown;
@@ -130,9 +190,10 @@ export function parseRun(lines: readonly StreamLine[], ctx: ParseContext): RunMe
     else if (event.type === "result") result = event;
     else if (event.type === "assistant" && isObj(event.message)) {
       const message = event.message;
+      let context: number | null = null;
       if (message.model !== "<synthetic>" && isObj(message.usage)) {
         const u = message.usage;
-        const context = num(u.input_tokens) + num(u.cache_creation_input_tokens) + num(u.cache_read_input_tokens);
+        context = num(u.input_tokens) + num(u.cache_creation_input_tokens) + num(u.cache_read_input_tokens);
         firstTurnContextTokens ??= context;
         const id = str(message.id) ?? `#${contextByMessage.size}`;
         if (!contextByMessage.has(id)) contextByMessage.set(id, context);
@@ -142,6 +203,8 @@ export function parseRun(lines: readonly StreamLine[], ctx: ParseContext): RunMe
         const id = str(block.id);
         const name = str(block.name);
         if (!id || !name || calls.has(id)) continue;
+        const jev = usesJev(name, block.input, sdkScripts);
+        if (jev) firstJevContextTokens ??= context;
         calls.set(id, {
           name,
           argChars: JSON.stringify(block.input ?? {}).length,
@@ -149,6 +212,7 @@ export function parseRun(lines: readonly StreamLine[], ctx: ParseContext): RunMe
           isError: false,
           latencyMs: null,
           jevInputTokens: null,
+          jev,
         });
         startedAt.set(id, line.receivedAt);
       }
@@ -174,7 +238,7 @@ export function parseRun(lines: readonly StreamLine[], ctx: ParseContext): RunMe
   const tools = list(init?.tools)
     .filter((t): t is string => typeof t === "string")
     .toSorted();
-  const invalid = invalidReason(init, tools, ctx.expectedTools);
+  const invalid = invalidReason(init, tools, ctx);
   const status = statusOf(invalid, result, quota, ctx);
   const byModel = usageByModel(result);
   const toolCalls = [...calls.values()];
@@ -196,6 +260,7 @@ export function parseRun(lines: readonly StreamLine[], ctx: ParseContext): RunMe
     jevTokens: toolCalls.reduce((s, c) => s + (c.jevInputTokens ?? 0), 0),
     firstTurnContextTokens,
     peakContextTokens: contextByMessage.size === 0 ? null : Math.max(...contextByMessage.values()),
+    firstJevContextTokens,
     modelCalls: contextByMessage.size,
     structuredOutput: result?.structured_output ?? null,
     terminalReason: str(result?.terminal_reason),

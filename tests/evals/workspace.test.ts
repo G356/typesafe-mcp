@@ -1,8 +1,55 @@
 import { describe, expect, test } from "bun:test";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { prepareWorkspace } from "../../evals/harness/workspace.ts";
+import { installSdk, prepareWorkspace } from "../../evals/harness/workspace.ts";
+
+describe("installSdk", () => {
+  test("copies the SDK into the workspace with a package.json that depends on it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "install-sdk-"));
+    const repo = join(root, "repo");
+    const ws = join(root, "ws");
+    const pkg = join(repo, "node_modules", "@typesafe-ai", "sdk");
+    await mkdir(join(pkg, "dist"), { recursive: true });
+    await mkdir(ws);
+    await writeFile(join(pkg, "package.json"), JSON.stringify({ name: "@typesafe-ai/sdk", version: "9.9.9" }));
+    await writeFile(join(pkg, "dist", "index.mjs"), "export {};");
+    try {
+      await installSdk(ws, repo);
+      expect(await readFile(join(ws, "node_modules", "@typesafe-ai", "sdk", "dist", "index.mjs"), "utf8")).toBe(
+        "export {};",
+      );
+      expect(JSON.parse(await readFile(join(ws, "package.json"), "utf8"))).toEqual({
+        private: true,
+        type: "module",
+        dependencies: { "@typesafe-ai/sdk": "9.9.9" },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps a task's own package.json, adding only the SDK to its dependencies, so SDK arms see the same repo", async () => {
+    const root = await mkdtemp(join(tmpdir(), "install-sdk-"));
+    const repo = join(root, "repo");
+    const ws = join(root, "ws");
+    const pkg = join(repo, "node_modules", "@typesafe-ai", "sdk");
+    await mkdir(pkg, { recursive: true });
+    await mkdir(ws);
+    await writeFile(join(pkg, "package.json"), JSON.stringify({ name: "@typesafe-ai/sdk", version: "9.9.9" }));
+    const own = { name: "ecommerce-service", scripts: { start: "bun src/index.ts" }, dependencies: { zod: "^4.0.0" } };
+    await writeFile(join(ws, "package.json"), JSON.stringify(own));
+    try {
+      await installSdk(ws, repo);
+      expect(JSON.parse(await readFile(join(ws, "package.json"), "utf8"))).toEqual({
+        ...own,
+        dependencies: { zod: "^4.0.0", "@typesafe-ai/sdk": "9.9.9" },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("prepareWorkspace", () => {
   test("copies source directory to workspace", async () => {
